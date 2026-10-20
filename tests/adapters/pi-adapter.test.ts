@@ -1,6 +1,8 @@
 import "../setup-home";
 import { describe, it, expect, beforeEach } from "vitest";
 import { homedir } from "node:os";
+import { readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { PiAdapter } from "../../src/adapters/pi/index.js";
 import { ClaudeCodeAdapter } from "../../src/adapters/claude-code/index.js";
@@ -12,6 +14,22 @@ describe("PiAdapter — Pi platform adapter", () => {
 
   beforeEach(() => {
     adapter = new PiAdapter();
+  });
+
+  describe("fork Git installation", () => {
+    it("loads a tracked source entry without generated build files or development dependencies", () => {
+      const root = resolve(import.meta.dirname, "../..");
+      const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+      const tracked = new Set(execFileSync("git", ["ls-files"], { cwd: root, encoding: "utf8" }).trim().split("\n"));
+      expect(pkg.pi.extensions).toEqual(["./src/adapters/pi/extension.ts"]);
+      expect(pkg.files).toContain("src");
+      for (const entry of pkg.pi.extensions) {
+        expect(tracked.has(entry.replace(/^\.\//, ""))).toBe(true);
+      }
+      const localEntry = readFileSync(join(root, ".pi/extensions/context-mode/index.ts"), "utf8");
+      expect(localEntry).toContain("src/adapters/pi/extension.js");
+      expect(localEntry).not.toContain("build/");
+    });
   });
 
   // ── Identity ───────────────────────────────────────────

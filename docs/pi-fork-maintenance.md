@@ -27,9 +27,32 @@ The snapshot cannot guarantee discovery of descendants that already daemonized a
 
 This change does not fix the underlying cause of every slow script or SQLite operation. It also cannot interrupt synchronous work already blocking the Pi host itself. Resetting the server does not intentionally delete database files, but in-memory server state is lost.
 
-## Build and install locally
+## Install from Git
 
-The Git checkout does not contain tracked `build/` artifacts. Do not assume that installing an unbuilt Git checkout provides a working Pi extension.
+The Pi package manifest points to the tracked TypeScript entry, `src/adapters/pi/extension.ts`. Pi's own loader handles TypeScript and relative `.js` imports that resolve to TypeScript source. The contributor entry under `.pi/extensions/context-mode/` uses the same source. The package includes `src/` for packed installations too.
+
+No generated `build/` directory, TypeScript compiler, development dependencies, or install-time build is required for Pi. The extension starts the tracked `server.bundle.mjs` for MCP tools. Keep that bundle in sync when changing server code; the Pi bridge itself loads from source.
+
+After verifying the fork, replace the official package:
+
+```sh
+pi remove npm:context-mode
+pi install https://github.com/Nebell/context-mode
+```
+
+Do not keep both package sources enabled. Fully restart Pi afterward. Pushing the fork alone does not change an existing npm installation.
+
+Use Pi's package updater for this Git source:
+
+```sh
+pi update https://github.com/Nebell/context-mode
+# Or update all configured packages:
+pi update --extensions
+```
+
+Pi can clean generated files and install only production dependencies without losing the source entry. Use Pi's updater rather than `ctx_upgrade`, whose upstream upgrade path is not a fork maintenance mechanism. Record the validated commit hash; specify a Git commit or tag in the package source if a fixed revision is required.
+
+## Develop locally
 
 ```sh
 git clone https://github.com/Nebell/context-mode.git
@@ -40,16 +63,7 @@ npm run build
 node node_modules/vitest/vitest.mjs run tests/adapters/pi-mcp-bridge.test.ts
 ```
 
-After the build and tests pass, replace the official npm package with this local checkout if desired:
-
-```sh
-pi remove npm:context-mode
-pi install "$PWD"
-```
-
-These commands change Pi's package configuration. Do not install both copies at once. Fully restart Pi afterward. Pushing this fork alone does not change an existing npm installation.
-
-For reproducible use, record the commit hash that passed testing. To update this local checkout, fast-forward to the reviewed fork commit, rebuild, rerun tests, and restart Pi. Do not update while another build is running in the same checkout.
+Developers can also install the checkout with `pi install "$PWD"`, instead of the Git source. Local checkouts require manual pull and dependency management. Do not install both copies at once or update while a build is running.
 
 ## Maintenance
 

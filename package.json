@@ -29,7 +29,7 @@
   "homepage": "https://github.com/mksglu/context-mode#readme",
   "pi": {
     "extensions": [
-      "./build/adapters/pi/extension.js"
+      "./src/adapters/pi/extension.ts"
     ],
     "skills": [
       "./skills"
@@ -60,6 +60,7 @@
   },
   "files": [
     "build",
+    "src",
     "hooks",
     "configs",
     "server.bundle.mjs",
