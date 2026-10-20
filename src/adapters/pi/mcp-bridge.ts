@@ -21,7 +21,7 @@
  * No external dependencies — pure node:child_process + JSON line frames.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { detectRuntimes } from "../../runtime.js";
@@ -127,13 +127,114 @@ export interface MCPCallResult {
 // Bridge-imposed timeout for protocol-handshake methods (initialize,
 // tools/list). These MUST be bounded: a server that never replies to
 // initialize would otherwise block Pi's bridge bootstrap indefinitely.
-// `tools/call` deliberately has NO bridge ceiling (#643) — long-running
-// ctx_execute (test suites, builds, cargo test) was rejected by a 120s
-// hardcoded bound even though the executor child would have finished.
-// Responsibility for bounding a tool call belongs to the executor
-// layer (per-tool timeout / background mode / Pi-level cancel), not
-// to the transport.
+// Nebell fork modification: a stalled server cannot enforce executor
+// timeouts or consume protocol cancellation. Bound tool calls in Pi too,
+// without restoring the short 120s ceiling removed in #643.
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+const DEFAULT_CALL_TIMEOUT_MS = 900_000;
+const CALL_COMPLETION_GRACE_MS = 30_000;
+const MAX_TIMER_MS = 2_147_483_647;
+
+export function toolCallTimeoutMs(
+  name: string,
+  args: unknown = {},
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  const configured = Number(env.CONTEXT_MODE_PI_CALL_TIMEOUT_MS);
+  const fallback = Number.isFinite(configured) && configured > 0
+    ? Math.min(Math.ceil(configured), MAX_TIMER_MS) : DEFAULT_CALL_TIMEOUT_MS;
+  const params = args && typeof args === "object" ? args as Record<string, unknown> : {};
+  const timeout = params.timeout;
+  if (!["ctx_execute", "ctx_execute_file", "ctx_batch_execute"].includes(name) ||
+      typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return fallback;
+  // The command pool does not cap concurrency by CPU count. Serial batches
+  // share one budget; parallel batches have per-command budgets.
+  const concurrency = typeof params.concurrency === "number" &&
+    Number.isInteger(params.concurrency) && params.concurrency > 1
+    ? Math.min(params.concurrency, 8) : 1;
+  const waves = name === "ctx_batch_execute" && concurrency > 1 && Array.isArray(params.commands)
+    ? Math.max(1, Math.ceil(params.commands.length / concurrency)) : 1;
+  const compileMs = name !== "ctx_batch_execute" && params.language === "rust"
+    ? Math.min(timeout, 60_000) : 0;
+  return Math.min(timeout * waves + compileMs + DEFAULT_REQUEST_TIMEOUT_MS + CALL_COMPLETION_GRACE_MS, MAX_TIMER_MS);
+}
+
+function toolAbortError(): Error {
+  const error = new Error("context-mode tool cancelled; MCP server reset. Other in-flight context-mode calls may also be interrupted.");
+  error.name = "AbortError";
+  return error;
+}
+
+interface LinuxProcessIdentity {
+  pid: number;
+  ppid: number;
+  group: number;
+  start: string;
+}
+
+function linuxProcess(pid: number): LinuxProcessIdentity | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    // comm can contain spaces/parentheses. Fields after its last ')' start
+    // at field 3 (state); kernel starttime is field 22.
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    if (fields.length < 20 || !fields[19]) return null;
+    return { pid, ppid: Number(fields[1]), group: Number(fields[2]), start: fields[19] };
+  } catch {
+    return null;
+  }
+}
+
+function bridgeProcessTree(child: ChildProcess): LinuxProcessIdentity[] {
+  if (process.platform !== "linux" || !child.pid ||
+      child.exitCode !== null || child.signalCode !== null) return [];
+  const root = linuxProcess(child.pid);
+  if (!root) return [];
+  const byParent = new Map<number, LinuxProcessIdentity[]>();
+  try {
+    for (const entry of readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const info = linuxProcess(Number(entry));
+      if (!info) continue;
+      const siblings = byParent.get(info.ppid) ?? [];
+      siblings.push(info);
+      byParent.set(info.ppid, siblings);
+    }
+  } catch {
+    return [root];
+  }
+  const result = [root];
+  const seen = new Set([root.pid]);
+  for (let i = 0; i < result.length; i++) {
+    for (const info of byParent.get(result[i].pid) ?? []) {
+      if (!seen.has(info.pid)) {
+        seen.add(info.pid);
+        result.push(info);
+      }
+    }
+  }
+  return result;
+}
+
+function signalBridgeTree(child: ChildProcess, snapshot: LinuxProcessIdentity[], signal: NodeJS.Signals): void {
+  const groups = new Set<number>();
+  const hostGroup = process.platform === "linux" ? linuxProcess(process.pid)?.group : undefined;
+  for (const info of snapshot) {
+    const current = linuxProcess(info.pid);
+    // Check PID + starttime again after reparenting or PID reuse. Never
+    // signal Pi's own process group.
+    if (current?.start === info.start && current.group === info.group &&
+        info.group > 1 && info.group !== hostGroup) groups.add(info.group);
+  }
+  if (!isWindows && snapshot.length === 0 && child.pid &&
+      child.exitCode === null && child.signalCode === null) groups.add(child.pid);
+  for (const group of groups) {
+    try { process.kill(-group, signal); } catch { /* already gone */ }
+  }
+  if ((isWindows || !child.pid) && child.exitCode == null && child.signalCode == null) {
+    try { child.kill(signal); } catch { /* already gone */ }
+  }
+}
 
 // Retry budget for the bridge bootstrap `initialize` handshake (#647).
 //
@@ -495,7 +596,7 @@ export class MCPStdioClient {
       }
     }
     this._spawnEnv = childEnv;
-    this.child = spawn(runtime, [this.serverScript], {
+    const child = this.child = spawn(runtime, [this.serverScript], {
       // Pipe stderr (#472 round-3): swallowing it via "ignore" hides
       // server crash diagnostics — the user only saw "ctx_* tools will
       // not be callable" with no clue WHY. We capture it so the diagnostic
@@ -504,9 +605,12 @@ export class MCPStdioClient {
       // write is rendered into the editor input box, blocking typing (#868).
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnv,
+      detached: !isWindows,
     });
-    this.child.stdout?.on("data", (chunk) => this.onData(chunk));
-    this.child.stderr?.on("data", (chunk: Buffer) => {
+    child.stdout?.on("data", (chunk) => {
+      if (this.child === child) this.onData(chunk);
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString("utf-8");
       // Forward each non-empty line, [mcp-bridge]-prefixed so it stays
       // grep-friendly in ~/.omp/logs. debug level: this is mostly routine
@@ -515,8 +619,9 @@ export class MCPStdioClient {
         if (line !== "") this.diag(`[mcp-bridge] ${line}`, "debug");
       }
     });
-    this.child.on("exit", () => this.onExit());
-    this.child.on("error", () => this.onExit());
+    // Retired generations must not reject replacement-server requests.
+    child.on("exit", () => { if (this.child === child) this.onExit(); });
+    child.on("error", () => { if (this.child === child) this.onExit(); });
   }
 
   private onExit(): void {
@@ -552,7 +657,9 @@ export class MCPStdioClient {
     method: string,
     params: unknown,
     timeoutMs: number = DEFAULT_REQUEST_TIMEOUT_MS,
+    signal?: AbortSignal,
   ): Promise<T> {
+    if (signal?.aborted) throw toolAbortError();
     // Respawn-on-idle-exit (#583, #583-followup).
     //
     // Initial #583 fix patched callTool() only. The structural location is
@@ -575,6 +682,8 @@ export class MCPStdioClient {
       }
       await this.respawnPromise;
     }
+    // Cancellation/deadline may have fired while initialize was in flight.
+    if (signal?.aborted) throw toolAbortError();
     if (!this.child) throw new Error("MCP client not started");
     const id = ++this.requestId;
     return new Promise<T>((resolve, reject) => {
@@ -616,14 +725,15 @@ export class MCPStdioClient {
   }
 
   private writeFrame(frame: string, onError?: (err: Error) => void): boolean {
-    if (!this.child || this.exited) {
+    const child = this.child;
+    if (!child || this.exited) {
       onError?.(new Error("MCP server exited"));
       return false;
     }
 
-    const stdin = this.child.stdin;
+    const stdin = child.stdin;
     if (!stdin || stdin.destroyed || stdin.writableEnded || stdin.closed) {
-      this.onExit();
+      if (this.child === child) this.onExit();
       onError?.(new Error("MCP server stdin unavailable"));
       return false;
     }
@@ -633,7 +743,7 @@ export class MCPStdioClient {
         if (!err) return;
         const code = (err as NodeJS.ErrnoException).code;
         if (code === "EPIPE" || code === "ERR_STREAM_DESTROYED") {
-          this.onExit();
+          if (this.child === child) this.onExit();
           onError?.(err);
           return;
         }
@@ -646,7 +756,7 @@ export class MCPStdioClient {
           ? (err as NodeJS.ErrnoException).code
           : undefined;
       if (err instanceof Error && (code === "EPIPE" || code === "ERR_STREAM_DESTROYED")) {
-        this.onExit();
+        if (this.child === child) this.onExit();
         onError?.(err);
         return false;
       }
@@ -679,25 +789,40 @@ export class MCPStdioClient {
     return Array.isArray(result.tools) ? result.tools : [];
   }
 
-  async callTool(name: string, args: unknown): Promise<MCPCallResult> {
-    // Respawn-on-idle-exit is now handled centrally in `request()`
-    // (#583 follow-up). Originally patched here in #583 — moving it up
-    // one layer covers `listTools` / `initialize` paths too, with a
-    // single-flight guard against orphan child processes from
-    // concurrent callers.
-    //
-    // No bridge-imposed timeout for tools/call (#643). The previous
-    // 120s ceiling rejected legitimate long-running ctx_execute calls
-    // (test suites, builds, large `cargo test`) even though the
-    // executor child would have finished. Bounding belongs to the
-    // executor layer (per-tool timeout / background mode / Pi cancel),
-    // not the transport. `Number.POSITIVE_INFINITY` instructs
-    // `request()` to skip the setTimeout entirely — see the gate there.
-    return this.request<MCPCallResult>(
-      "tools/call",
-      { name, arguments: args ?? {} },
-      Number.POSITIVE_INFINITY,
-    );
+  async callTool(name: string, args: unknown, signal?: AbortSignal): Promise<MCPCallResult> {
+    if (signal?.aborted) throw toolAbortError();
+    const timeoutMs = toolCallTimeoutMs(name, args, this.env);
+    const dispatch = new AbortController();
+    // This timer runs in Pi, outside a blocked MCP server. Include respawn
+    // and initialize in the deadline, not only the final request's wait.
+    return new Promise<MCPCallResult>((resolve, reject) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (error: unknown, result?: MCPCallResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        if (error) reject(error);
+        else resolve(result!);
+      };
+      const stop = (error: Error) => {
+        if (settled) return;
+        finish(error);
+        dispatch.abort();
+        // Protocol cancellation cannot interrupt synchronous server work or
+        // executors that do not consume the SDK signal. Reset this session.
+        this.shutdown(error);
+      };
+      const onAbort = () => stop(toolAbortError());
+      timer = setTimeout(() => stop(new Error(
+        `context-mode bridge timeout after ${timeoutMs}ms: ${name}; MCP server reset. Other in-flight context-mode calls may also be interrupted.`,
+      )), timeoutMs);
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) { onAbort(); return; }
+      this.request<MCPCallResult>("tools/call", { name, arguments: args ?? {} }, Number.POSITIVE_INFINITY, dispatch.signal)
+        .then(result => finish(null, result), error => finish(error));
+    });
   }
 
   /**
@@ -730,32 +855,21 @@ export class MCPStdioClient {
     await this.initialize();
   }
 
-  shutdown(): void {
-    if (!this.child) return;
+  shutdown(reason: Error = new Error("context-mode MCP server stopped")): void {
     const child = this.child;
-    try {
-      child.kill("SIGTERM");
-    } catch {
-      // best effort
-    }
-    // SIGKILL fallback (#472 round-3): a child that ignores SIGTERM
-    // (e.g. installed handler that swallows the signal, or stuck in
-    // an uninterruptible syscall) becomes a zombie because we null
-    // the handle immediately. Schedule a hard kill bounded at 5s; the
-    // .unref() prevents this timer from keeping the parent alive after
-    // legitimate work is done.
-    setTimeout(() => {
-      try {
-        if (child.exitCode === null && child.signalCode === null) {
-          child.kill("SIGKILL");
-        }
-      } catch {
-        // best effort
-      }
-    }, 5000).unref();
     this.child = null;
     this.initialized = false;
     this.exited = true;
+    this.buffer = "";
+    // A blocked/TERM-resistant child must not keep Pi's tools pending.
+    for (const pending of this.pending.values()) pending.reject(reason);
+    this.pending.clear();
+    if (!child) return;
+    // Executors create their own detached process groups. Snapshot their
+    // identities before killing the server and losing the parent links.
+    const snapshot = bridgeProcessTree(child);
+    signalBridgeTree(child, snapshot, "SIGTERM");
+    setTimeout(() => signalBridgeTree(child, snapshot, "SIGKILL"), 5000).unref();
   }
 }
 
@@ -784,6 +898,7 @@ export interface PiToolRegistration {
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
+    signal?: AbortSignal,
   ) => Promise<{
     content: Array<{ type: "text"; text: string }>;
     details: Record<string, unknown>;
@@ -1031,8 +1146,8 @@ export async function bootstrapMCPTools(
       parameters: tool.inputSchema ?? { type: "object", properties: {} },
       renderCall: createContextModeCallRenderer(tool.name),
       renderResult: createContextModeResultRenderer(tool.name),
-      async execute(_toolCallId, params) {
-        const result = await client.callTool(tool.name, params ?? {});
+      async execute(_toolCallId, params, signal) {
+        const result = await client.callTool(tool.name, params ?? {}, signal);
         const text = (result.content ?? [])
           .filter((c) => c?.type === "text" && typeof c.text === "string")
           .map((c) => c.text as string)

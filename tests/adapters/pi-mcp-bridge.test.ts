@@ -24,8 +24,9 @@ import "../setup-home";
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { EventEmitter, getEventListeners } from "node:events";
+import type { MCPStdioClient as BridgeClient } from "../../src/adapters/pi/mcp-bridge.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -42,6 +43,280 @@ afterEach(() => {
     /* best effort */
   }
   delete process.env.CONTEXT_MODE_BRIDGE_DEPTH;
+});
+
+// Nebell fork modification: cancellation regression for hung tools (#959).
+describe("MCPStdioClient — cancellable hung tools", () => {
+  it("settles a hung tool promptly when Pi aborts it", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const serverPath = join(scratch, "hang.mjs");
+    writeFileSync(serverPath, "process.stdin.resume(); setInterval(() => {}, 1000);\n");
+    const client = new MCPStdioClient(serverPath, process.env, process.execPath);
+    client.start();
+    const abort = new AbortController();
+    try {
+      const outcome = client.callTool("hang", {}, abort.signal)
+        .then(() => "resolved", (error: Error) => error.name);
+      abort.abort();
+      const result = await Promise.race([
+        outcome,
+        new Promise(resolve => setTimeout(() => resolve("still pending"), 100)),
+      ]);
+      expect(result).toBe("AbortError");
+    } finally {
+      client.shutdown();
+    }
+  });
+});
+
+// Nebell fork regression coverage: bounded cancellation and isolated recovery.
+describe("MCPStdioClient — watchdog and recovery", () => {
+  const clients: BridgeClient[] = [];
+  const fixture = `
+    import { createInterface } from 'node:readline';
+    import { spawn } from 'node:child_process';
+    const reply = (id, result) => process.stdout.write(JSON.stringify({jsonrpc:'2.0', id, result})+'\\n');
+    const success = text => ({content:[{type:'text',text}]});
+    createInterface({input:process.stdin}).on('line', line => {
+      const {id,method,params} = JSON.parse(line);
+      if(method==='initialize') return reply(id, {});
+      if(method==='tools/list') return reply(id, {tools:['hang','echo','fail','tree','block'].map(name=>({name,inputSchema:{type:'object'}}))});
+      if(method!=='tools/call') return;
+      if(params.name==='echo') return reply(id,success(String(params.arguments?.value??'ok')));
+      if(params.name==='fail') return reply(id,{...success('fixture failure'),isError:true});
+      if(params.name==='tree') {
+        const child=spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{}); console.log(process.pid); setInterval(()=>{},1000)"],{detached:true,stdio:['ignore','pipe','ignore']});
+        child.stdout.once('data',()=>reply(id,success(JSON.stringify({server:process.pid,executor:child.pid}))));
+      }
+      if(params.name==='block') for(;;) {}
+    });
+  `;
+  function serverPath(): string {
+    const path = join(scratch, `watchdog-${clients.length}.mjs`);
+    writeFileSync(path, fixture);
+    return path;
+  }
+  async function client(timeout = 3000): Promise<BridgeClient> {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const c = new MCPStdioClient(serverPath(), {
+      ...process.env, CONTEXT_MODE_PI_CALL_TIMEOUT_MS: String(timeout),
+    }, process.execPath);
+    clients.push(c);
+    c.start();
+    await c.initialize();
+    return c;
+  }
+  function alive(pid: number): boolean {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[0]);
+    } catch { return false; }
+  }
+  async function eventually(predicate: () => boolean, budget = 2500): Promise<void> {
+    const end = Date.now() + budget;
+    while (!predicate()) {
+      if (Date.now() > end) throw new Error("condition did not become true");
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+  afterEach(() => {
+    for (const c of clients.splice(0)) c.shutdown();
+    vi.useRealTimers();
+  });
+
+  it("preserves executor, Rust compile, restart and batch budgets without CPU clamping", async () => {
+    const { toolCallTimeoutMs: budget } = await import("../../src/adapters/pi/mcp-bridge.js");
+    expect(budget("ctx_search", {}, {})).toBe(900000);
+    expect(budget("ctx_search", {}, {CONTEXT_MODE_PI_CALL_TIMEOUT_MS:"250"})).toBe(250);
+    for (const value of ["0", "-1", "Infinity", "NaN", ""])
+      expect(budget("ctx_search", {}, {CONTEXT_MODE_PI_CALL_TIMEOUT_MS:value})).toBe(900000);
+    for (const name of ["ctx_execute", "ctx_execute_file", "ctx_batch_execute"])
+      expect(budget(name, {timeout:900000}, {})).toBe(990000);
+    expect(budget("ctx_execute", {timeout:900000,language:"rust"}, {})).toBe(1050000);
+    expect(budget("ctx_execute_file", {timeout:900000,language:"rust"}, {})).toBe(1050000);
+    expect(budget("ctx_batch_execute", {timeout:900000,commands:Array(9).fill({}),concurrency:2}, {})).toBe(4590000);
+    expect(budget("ctx_execute", {timeout:Number.MAX_VALUE}, {})).toBe(2147483647);
+  });
+
+  it("allows a 50s Rust compile followed by 890s execution", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    vi.useFakeTimers();
+    const c = new MCPStdioClient("/unused");
+    const reset = vi.spyOn(c, "shutdown");
+    vi.spyOn(c, "request").mockImplementation(() => new Promise(resolve => setTimeout(() => resolve({content:[]}), 940000)));
+    const result = c.callTool("ctx_execute", {language:"rust",timeout:900000});
+    await vi.advanceTimersByTimeAsync(940000);
+    expect(await result).toEqual({content:[]});
+    expect(reset).not.toHaveBeenCalled();
+  });
+
+  it("allows a 50s respawn before the explicit execution budget", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    vi.useFakeTimers();
+    const c = new MCPStdioClient("/unused");
+    const internal = c as any;
+    internal.exited = true;
+    const reset = vi.spyOn(c, "shutdown");
+    internal.respawn = async () => {
+      await new Promise(resolve => setTimeout(resolve, 50000));
+      internal.exited = false; internal.child = {};
+    };
+    internal.writeFrame = (frame: string) => {
+      const {id} = JSON.parse(frame);
+      setTimeout(() => internal.onData(Buffer.from(JSON.stringify({id,result:{content:[]}})+"\n")),890000);
+      return true;
+    };
+    const result = c.callTool("ctx_execute", {timeout:900000});
+    await vi.advanceTimersByTimeAsync(940000);
+    expect(await result).toEqual({content:[]});
+    expect(reset).not.toHaveBeenCalled();
+  });
+
+  it("removes abort listeners after success and does not reset on a later abort", async () => {
+    const c = await client();
+    const a = new AbortController();
+    expect((await c.callTool("echo", {value:"hello"}, a.signal)).content?.[0].text).toBe("hello");
+    expect((await c.callTool("fail", {})).isError).toBe(true);
+    expect(getEventListeners(a.signal, "abort")).toHaveLength(0);
+    a.abort();
+    expect((await c.callTool("echo", {})).content?.[0].text).toBe("ok");
+  });
+
+  it("does not dispatch or reset for an already aborted call", async () => {
+    const c = await client();
+    const before = (c as any).child;
+    const a = new AbortController(); a.abort();
+    await expect(c.callTool("hang", {}, a.signal)).rejects.toMatchObject({name:"AbortError"});
+    expect((c as any).child).toBe(before);
+    expect((c as any).pending.size).toBe(0);
+  });
+
+  it("cancels siblings then single-flight respawns concurrent follow-up calls", async () => {
+    const c = await client();
+    const old = (c as any).child;
+    const a = new AbortController();
+    const first = expect(c.callTool("hang", {}, a.signal)).rejects.toMatchObject({name:"AbortError"});
+    const sibling = expect(c.callTool("hang", {})).rejects.toThrow(/cancelled/);
+    a.abort();
+    await Promise.all([first, sibling]);
+    expect((c as any).pending.size).toBe(0);
+    const results = await Promise.all([c.callTool("echo",{value:"one"}),c.callTool("echo",{value:"two"})]);
+    expect(results.map(r=>r.content?.[0].text)).toEqual(["one","two"]);
+    expect((c as any).child.pid).not.toBe(old.pid);
+    await eventually(()=>old.exitCode!==null||old.signalCode!==null);
+    expect((c as any).exited).toBe(false);
+  });
+
+  it("times out a synchronously blocked server and recovers", async () => {
+    const c = await client(150);
+    await expect(c.callTool("block", {})).rejects.toThrow(/bridge timeout after 150ms/);
+    (c as any).env.CONTEXT_MODE_PI_CALL_TIMEOUT_MS = "3000";
+    expect((await c.callTool("echo", {})).content?.[0].text).toBe("ok");
+  });
+
+  it("does not dispatch an abandoned call after a delayed respawn", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    for (const mode of ["abort", "timeout"]) {
+      const c = new MCPStdioClient("/unused", {CONTEXT_MODE_PI_CALL_TIMEOUT_MS:mode==="timeout"?"30":"3000"});
+      const internal = c as any;
+      internal.exited = true;
+      let release!: () => void;
+      internal.respawn = async () => { await new Promise<void>(resolve=>{release=resolve;}); internal.exited=false; };
+      internal.writeFrame = vi.fn();
+      const a = new AbortController();
+      const rejected = expect(c.callTool("hang", {}, a.signal)).rejects.toThrow(mode==="timeout"?/bridge timeout/:/cancelled/);
+      if(mode==="abort") a.abort();
+      await rejected;
+      release();
+      await new Promise(resolve=>setTimeout(resolve,20));
+      expect(internal.writeFrame).not.toHaveBeenCalled();
+      expect(internal.pending.size).toBe(0);
+    }
+  });
+
+  it("ignores retired process exit, stdout and stdin write errors", async () => {
+    const c = await client();
+    const old = (c as any).child;
+    let callback!: (error: Error) => void;
+    old.stdin.write = (_frame: string, cb: (error: Error) => void) => {callback=cb;return true;};
+    const rejected = expect(c.request("tools/call",{name:"hang",arguments:{}})).rejects.toThrow(/stopped/);
+    c.shutdown(); await rejected;
+    await c.callTool("echo", {});
+    const current = (c as any).child;
+    const active = expect(c.callTool("hang", {})).rejects.toThrow(/stopped/);
+    old.stdout.emit("data",Buffer.from(JSON.stringify({id:(c as any).requestId,result:{invalid:true}})+"\n"));
+    old.emit("exit",0,null);
+    callback(Object.assign(new Error("late pipe error"),{code:"EPIPE"}));
+    expect((c as any).child).toBe(current);
+    expect((c as any).exited).toBe(false);
+    expect((c as any).pending.size).toBe(1);
+    c.shutdown(); await active;
+  });
+
+  it.skipIf(process.platform!=="linux")("kills a detached TERM-resistant executor without killing another session", async () => {
+    const c = await client();
+    const other = await client();
+    const first = JSON.parse((await c.callTool("tree", {})).content![0].text!);
+    const sentinel = JSON.parse((await other.callTool("tree", {})).content![0].text!);
+    try {
+      const a = new AbortController();
+      const rejected = expect(c.callTool("hang", {}, a.signal)).rejects.toMatchObject({name:"AbortError"});
+      a.abort(); await rejected;
+      expect((await c.callTool("echo", {})).content?.[0].text).toBe("ok");
+      const replacement = (c as any).child.pid;
+      await eventually(()=>!alive(first.executor),7000);
+      expect(alive(first.server)).toBe(false);
+      expect(alive(replacement)).toBe(true);
+      expect(alive(sentinel.server)).toBe(true);
+      expect(alive(sentinel.executor)).toBe(true);
+    } finally {
+      for (const pid of [first.executor,sentinel.executor]) {
+        try {process.kill(-pid,"SIGKILL");} catch {/* already stopped */}
+      }
+    }
+  }, 10000);
+
+  it.skipIf(process.platform!=="linux")("executes, indexes, cancels and recovers through the real server with isolated storage", async () => {
+    const { MCPStdioClient } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const c = new MCPStdioClient(join(import.meta.dirname, "../../server.bundle.mjs"), {
+      ...process.env, HOME:scratch, USERPROFILE:scratch,
+      PI_CONFIG_DIR:join(scratch,".pi"), CONTEXT_MODE_DIR:join(scratch,"storage"),
+      CONTEXT_MODE_PROJECT_DIR:scratch, CONTEXT_MODE_BRIDGE_IDLE_MS:"0",
+      CONTEXT_MODE_PI_CALL_TIMEOUT_MS:"15000",
+    }, process.execPath);
+    clients.push(c);
+    c.start(); await c.initialize();
+    const text = (r: {content?: Array<{text?: string}>}) => r.content?.map(x=>x.text??"").join("\n")??"";
+    const execute = (code: string, signal?: AbortSignal, timeout=900000) =>
+      c.callTool("ctx_execute",{language:"javascript",code,timeout,cwd:scratch},signal);
+    expect(text(await execute("console.log('real-execute-ok')"))).toContain("real-execute-ok");
+    await c.callTool("ctx_index",{content:"# Regression\n\nquartznebula regression marker.",source:"fork-regression"});
+    expect(text(await c.callTool("ctx_search",{queries:["quartznebula"],source:"fork-regression"}))).toContain("quartznebula");
+    expect(text(await execute("setInterval(()=>{},1000)",undefined,100))).toContain("timed out after 100ms");
+    const marker = join(scratch,"executor-started.json");
+    const a = new AbortController();
+    const rejected = expect(execute(`require('fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid}));setInterval(()=>{},1000);`,a.signal)).rejects.toMatchObject({name:"AbortError"});
+    await eventually(()=>existsSync(marker),7000);
+    const pid = JSON.parse(readFileSync(marker,"utf8")).pid;
+    a.abort(); await rejected;
+    if(process.platform==="linux") await eventually(()=>!alive(pid),7000);
+    expect(text(await execute("console.log('real-recovered-ok')"))).toContain("real-recovered-ok");
+  }, 25000);
+
+  it("forwards the registered Pi tool's third argument and preserves tool errors", async () => {
+    const { bootstrapMCPTools } = await import("../../src/adapters/pi/mcp-bridge.js");
+    const tools = new Map<string, any>();
+    const handle = await bootstrapMCPTools({registerTool:tool=>{tools.set(tool.name,tool);}},serverPath(),{
+      env:{...process.env,CONTEXT_MODE_BRIDGE_DEPTH:"0",CONTEXT_MODE_PI_CALL_TIMEOUT_MS:"3000"},
+      _resolveJsRuntime:()=>process.execPath,
+    });
+    clients.push(handle.client);
+    await expect(tools.get("fail").execute("id",{})).rejects.toThrow("fixture failure");
+    const a = new AbortController();
+    const rejected = expect(tools.get("hang").execute("id",{},a.signal)).rejects.toMatchObject({name:"AbortError"});
+    a.abort(); await rejected;
+    expect((await tools.get("echo").execute("id",{})).content[0].text).toBe("ok");
+  });
 });
 
 // Slice 1 — runtime name guard
